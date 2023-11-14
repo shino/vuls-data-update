@@ -47,6 +47,7 @@ import (
 	mitreV5 "github.com/MaineK00n/vuls-data-update/pkg/fetch/mitre/v5"
 	"github.com/MaineK00n/vuls-data-update/pkg/fetch/msf"
 
+	nvdAPI "github.com/MaineK00n/vuls-data-update/pkg/fetch/nvd/api"
 	nvdAPICVE "github.com/MaineK00n/vuls-data-update/pkg/fetch/nvd/api/cve"
 	nvdFeedCPE "github.com/MaineK00n/vuls-data-update/pkg/fetch/nvd/feed/cpe"
 	nvdFeedCPEMatch "github.com/MaineK00n/vuls-data-update/pkg/fetch/nvd/feed/cpematch"
@@ -2229,11 +2230,11 @@ func newCmdFetchNVDAPICVE() *cobra.Command {
 		`),
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			if err := nvdAPICVE.Fetch(nvdAPICVE.WithDir(filepath.Join(options.dir, "nvd", "api", "cve")),
-				nvdAPICVE.WithRetry(options.retry),
-				nvdAPICVE.WithAPIKey(options.apiKey),
-				nvdAPICVE.WithWait(options.wait),
-				nvdAPICVE.WithConcurrency(options.concurrency)); err != nil {
+			if err := nvdAPICVE.Fetch(nvdAPI.WithDir(filepath.Join(options.dir, "nvd", "api", "cve")),
+				nvdAPI.WithRetry(options.retry),
+				nvdAPI.WithAPIKey(options.apiKey),
+				nvdAPI.WithWait(options.wait),
+				nvdAPI.WithConcurrency(options.concurrency)); err != nil {
 				return errors.Wrap(err, "failed to fetch nvd api cve")
 			}
 			return nil

@@ -9,10 +9,11 @@ import (
 	"os"
 	"testing"
 
-	"github.com/MaineK00n/vuls-data-update/pkg/fetch/nvd/api/cve"
 	"github.com/google/go-cmp/cmp"
-
 	"path/filepath"
+
+	"github.com/MaineK00n/vuls-data-update/pkg/fetch/nvd/api"
+	"github.com/MaineK00n/vuls-data-update/pkg/fetch/nvd/api/cve"
 )
 
 func TestFetch(t *testing.T) {
@@ -73,10 +74,10 @@ func TestFetch(t *testing.T) {
 			}
 
 			dir := t.TempDir()
-			opts := []cve.Option{
-				cve.WithBaseURL(u), cve.WithDir(dir), cve.WithAPIKey(tt.apiKey),
-				cve.WithConcurrency(2), cve.WithWait(0), cve.WithRetry(0),
-				cve.WithResultsPerPage(3),
+			opts := []api.Option{
+				api.WithBaseURL(u), api.WithDir(dir), api.WithAPIKey(tt.apiKey),
+				api.WithConcurrency(2), api.WithWait(0), api.WithRetry(0),
+				api.WithResultsPerPage(3),
 			}
 			err = cve.Fetch(opts...)
 			switch {
