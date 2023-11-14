@@ -11,11 +11,14 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/cheggaaa/pb/v3"
 	"github.com/hashicorp/go-retryablehttp"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/MaineK00n/vuls-data-update/pkg/fetch/util"
 	utilhttp "github.com/MaineK00n/vuls-data-update/pkg/fetch/util/http"
+	"math"
 )
 
 const (
@@ -135,6 +138,10 @@ func Fetch(opts ...Option) error {
 		if ctx.Err() != nil {
 			return false, ctx.Err()
 		}
+		if err != nil {
+			fmt.Printf("err: %#v\n", err)
+			return false, errors.Wrap(err, "checkRetry")
+		}
 
 		// NVD JSON API returns 403 in rate limit excesses, should retry.
 		// Also, the API returns 408 infreqently.
@@ -149,83 +156,146 @@ func Fetch(opts ...Option) error {
 
 	c := utilhttp.NewClient(utilhttp.WithClientRetryMax(options.retry), utilhttp.WithClientCheckRetry(checkRetry))
 
+	// 100 is just tentative
+	bar := pb.Full.Start(100)
+	urlChan := make(chan string, 100)
+	finishedChan := make(chan finished, options.concurrency)
+
+	//  TODO(shino): errorgroup needed?
+	workers, workersCtx := errgroup.WithContext(context.Background())
+	for i := 0; i < options.concurrency; i++ {
+		workers.Go(func() error { return worker(options, c, workersCtx, urlChan, finishedChan, bar) })
+	}
+
+	//  TODO(shino): errogroup is overkill?
+	coordG, coordCtx := errgroup.WithContext(context.Background())
+	//  TODO(shino): cleanup task?
+	coordG.Go(func() error { return coordinator(options, coordCtx, urlChan, finishedChan, bar) })
+	if err := coordG.Wait(); err != nil {
+		return errors.Wrap(err, "err in goroutine")
+	}
+	if err := workers.Wait(); err != nil {
+		return errors.Wrap(err, "err in goroutine")
+	}
+	bar.Finish()
+	return nil
+}
+
+type finished struct {
+	startIndex     int
+	resultsPerPage int
+	totalResults   int
+}
+
+func coordinator(options *options, ctx context.Context, urlChan chan<- string, finishedChan <-chan finished, bar *pb.ProgressBar) error {
+	firstURL, err := fullURL(options.baseURL, 0, options.resultsPerPage)
+	if err != nil {
+		return errors.Wrapf(err, "fullURL")
+	}
+	urlChan <- firstURL
+	currentTotalPages := 1
+	finishedCount := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			return errors.Wrapf(ctx.Err(), "interrupted too early")
+		case finished := <-finishedChan:
+			finishedCount++
+			pages := int(math.Ceil(float64(finished.totalResults) / float64(options.resultsPerPage)))
+			if delta := pages - currentTotalPages; delta > 0 {
+				newURLs := make([]string, 0, delta)
+				bar.AddTotal(int64(pages) - bar.Total())
+
+				for i := currentTotalPages; i < pages; i++ {
+					url, err := fullURL(options.baseURL, i*options.resultsPerPage, options.resultsPerPage)
+					if err != nil {
+						return errors.Wrapf(err, "fullURL")
+					}
+					newURLs = append(newURLs, url)
+				}
+				// sending data to urlChan may block, spawn a new goroutine
+				//  TODO(shino): life monitoring
+				go func(newURLs []string) {
+					for _, u := range newURLs {
+						urlChan <- u
+					}
+				}(newURLs)
+
+				currentTotalPages = pages
+			}
+			if finished.totalResults <= finished.startIndex+options.resultsPerPage {
+				// Final page fetched, no more new URLs
+				close(urlChan)
+				// Flush finished channel to not block workers
+				for finishedCount < currentTotalPages {
+					select {
+					case <-finishedChan:
+						finishedCount++
+					}
+				}
+				return nil
+			} else {
+				// Sanity check for non-final pages, should have full count
+				if finished.resultsPerPage != options.resultsPerPage {
+					return errors.Errorf("unexpected resultsPerPage, expected: %d, actual: %d", options.resultsPerPage, finished.resultsPerPage)
+				}
+			}
+		}
+	}
+}
+
+func worker(options *options, c *utilhttp.Client, ctx context.Context, urlChan <-chan string, finishedChan chan<- finished, bar *pb.ProgressBar) error {
 	h := make(http.Header)
 	if options.apiKey != "" {
 		h.Add("apiKey", options.apiKey)
 	}
 	headerOption := utilhttp.WithRequestHeader(h)
 
-	// Preliminary API call to get totalResults.
-	// Use 1 as resultsPerPage to save time.
-	u, err := fullURL(options.baseURL, 0, 1)
-	if err != nil {
-		return errors.Wrap(err, "full URL")
-	}
-	bs, err := c.Get(u, headerOption)
-	if err != nil {
-		return errors.Wrap(err, "preliminary API call")
-	}
-	var preliminary api20
-	if err := json.Unmarshal(bs, &preliminary); err != nil {
-		return errors.Wrap(err, "unmarshal")
-	}
-	totalResults := preliminary.TotalResults
-	preciselyPaged := (totalResults % options.resultsPerPage) == 0
-	pages := totalResults / options.resultsPerPage
-	if !preciselyPaged {
-		pages++
-	}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case u := <-urlChan:
+			if u == "" {
+				return nil
+			}
 
-	// Actual API calls
-	us := make([]string, 0, pages)
-	for startIndex := 0; startIndex < totalResults; startIndex += options.resultsPerPage {
-		url, err := fullURL(options.baseURL, startIndex, options.resultsPerPage)
-		if err != nil {
-			return errors.Wrap(err, "full URL")
-		}
-		us = append(us, url)
-	}
-
-	nextTask := func(bs []byte) error {
-		var response api20
-		if err := json.Unmarshal(bs, &response); err != nil {
-			return errors.Wrap(err, "unmarshal json")
-		}
-
-		// Sanity check:
-		// NVD's API document does not say response item counts are request's resultsPerPage in non-final pages.
-		// If we don't check the counts, we may have incomplete results.
-		finalStartIndex := options.resultsPerPage * (pages - 1)
-		expectedResults := options.resultsPerPage
-		if response.StartIndex == finalStartIndex && !preciselyPaged {
-			expectedResults = totalResults % options.resultsPerPage
-		}
-		actualResults := len(response.Vulnerabilities)
-		if expectedResults != actualResults {
-			return errors.Errorf("unexpected results at startIndex: %d, expected: %d actual: %d", response.StartIndex, expectedResults, actualResults)
-		}
-
-		for _, v := range response.Vulnerabilities {
-			splitted, err := util.Split(v.CVE.ID, "-", "-")
+			bs, err := c.Get(u, headerOption)
 			if err != nil {
-				log.Printf("[WARN] unexpected ID format. expected: %q, actual: %q", "CVE-yyyy-\\d{4,}", v.CVE.ID)
-				continue
+				return errors.Wrapf(err, "get %s", u)
 			}
-			if _, err := time.Parse("2006", splitted[1]); err != nil {
-				log.Printf("[WARN] unexpected ID format. expected: %q, actual: %q", "CVE-yyyy-\\d{4,}", v.CVE.ID)
-				continue
+			var response api20
+			if err := json.Unmarshal(bs, &response); err != nil {
+				return errors.Wrap(err, "unmarshal json")
 			}
 
-			if err := util.Write(filepath.Join(options.dir, splitted[1], fmt.Sprintf("%s.json", v.CVE.ID)), v); err != nil {
-				return errors.Wrapf(err, "write %s", filepath.Join(options.dir, splitted[1], fmt.Sprintf("%s.json", v.CVE.ID)))
+			for _, v := range response.Vulnerabilities {
+				splitted, err := util.Split(v.CVE.ID, "-", "-")
+				if err != nil {
+					log.Printf("[WARN] unexpected ID format. expected: %q, actual: %q", "CVE-yyyy-\\d{4,}", v.CVE.ID)
+					continue
+				}
+				if _, err := time.Parse("2006", splitted[1]); err != nil {
+					log.Printf("[WARN] unexpected ID format. expected: %q, actual: %q", "CVE-yyyy-\\d{4,}", v.CVE.ID)
+					continue
+				}
+
+				if err := util.Write(filepath.Join(options.dir, splitted[1], fmt.Sprintf("%s.json", v.CVE.ID)), v); err != nil {
+					return errors.Wrapf(err, "write %s", filepath.Join(options.dir, splitted[1], fmt.Sprintf("%s.json", v.CVE.ID)))
+				}
 			}
+
+			finishedChan <- finished{
+				startIndex:     response.StartIndex,
+				resultsPerPage: response.ResultsPerPage,
+				totalResults:   response.TotalResults,
+			}
+			bar.Increment()
+			time.Sleep(time.Duration(options.wait) * time.Second)
 		}
-		return nil
 	}
-	if err := c.PipelineGet(us, options.concurrency, options.wait, nextTask, headerOption); err != nil {
-		return errors.Wrap(err, "pipeline get")
-	}
-	return nil
+
 }
 
 func fullURL(baseURL string, startIndex, resultsPerPage int) (string, error) {
