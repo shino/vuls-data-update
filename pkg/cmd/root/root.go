@@ -6,6 +6,7 @@ import (
 
 	extractCmd "github.com/MaineK00n/vuls-data-update/pkg/cmd/extract"
 	fetchCmd "github.com/MaineK00n/vuls-data-update/pkg/cmd/fetch"
+	vulnrichmentCmd "github.com/MaineK00n/vuls-data-update/pkg/cmd/vulnrichment"
 )
 
 func NewCmdRoot() *cobra.Command {
@@ -22,7 +23,7 @@ func NewCmdRoot() *cobra.Command {
 		`),
 	}
 
-	cmd.AddCommand(fetchCmd.NewCmdFetch(), extractCmd.NewCmdExtract())
+	cmd.AddCommand(fetchCmd.NewCmdFetch(), extractCmd.NewCmdExtract(), vulnrichmentCmd.NewCmdVulnrichment())
 
 	return cmd
 }
